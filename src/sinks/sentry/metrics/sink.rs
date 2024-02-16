@@ -22,6 +22,14 @@ fn finish_metric(source_metric: &SourceMetric, mut sentry_metric: MetricBuilder)
         }
     }
 
+    if let Some(meta_object) = source_metric.metadata().value().as_object() {
+        if let Some(unit) = meta_object.get("sentry_unit") {
+            if let Some(unit) = unit.as_str() {
+                sentry_metric = sentry_metric.with_unit(unit.into_owned());
+            }
+        }
+    }
+
     // we need to carry forward the original timestamp as otherwise the SDK will use the current
     // time. otherwise this causes bad visual artifacts when backpressure happens and unnecessarily
     // relies on vector's system clock.
