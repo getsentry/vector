@@ -116,6 +116,8 @@ on:
         value: ${{ jobs.int_tests.outputs.splunk }}
       webhdfs:
         value: ${{ jobs.int_tests.outputs.webhdfs }}
+      sentry:
+        value: ${{ jobs.int_tests.outputs.sentry }}
       all-changes-json:
         value: ${{ jobs.int_tests.outputs.all-changes-json }}
       # e2e tests
@@ -243,6 +245,7 @@ jobs:
       redis: ${{ steps.filter.outputs.redis }}
       splunk: ${{ steps.filter.outputs.splunk }}
       webhdfs: ${{ steps.filter.outputs.webhdfs }}
+      sentry: ${{ steps.filter.outputs.sentry }}
       all-changes-json: ${{ steps.aggregate.outputs.all-changes-json }}
     steps:
       - uses: actions/checkout@v4
@@ -301,7 +304,8 @@ jobs:
             "pulsar": ${{ steps.filter.outputs.pulsar }},
             "redis": ${{ steps.filter.outputs.redis }},
             "splunk": ${{ steps.filter.outputs.splunk }},
-            "webhdfs": ${{ steps.filter.outputs.webhdfs }}
+            "webhdfs": ${{ steps.filter.outputs.webhdfs }},
+            "sentry": ${{ steps.filter.outputs.sentry }}
           }
           EOF
           )

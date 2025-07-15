@@ -93,7 +93,7 @@ jobs:
           "datadog-logs", "datadog-metrics", "datadog-traces", "dnstap", "docker-logs", "elasticsearch",
           "eventstoredb", "fluent", "gcp", "greptimedb", "http-client", "influxdb", "kafka", "logstash",
           "loki", "mongodb", "nats", "nginx", "opentelemetry", "postgres", "prometheus", "pulsar",
-          "redis", "splunk", "webhdfs"
+          "redis", "splunk", "webhdfs",
         ]
     steps:
       - uses: actions/checkout@v4
