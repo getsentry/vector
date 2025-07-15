@@ -5,7 +5,7 @@ test_filter: "::sentry::"
 
 runner:
   env:
-    SENTRY_DSN:
+    SENTRY_DSN: http://test_public_key_12345abcdb1e4c123490ecec89c1f199@localhost:3001/1
 
 matrix:
   version: [latest]

@@ -1,0 +1,14 @@
+{
+  "slug": "vector-integration-test",
+  "disabled": false,
+  "publicKeys": [
+    {
+      "publicKey": "test_public_key_12345abcdb1e4c123490ecec89c1f199",
+      "isEnabled": true
+    }
+  ],
+  "config": {
+    "allowedDomains": ["*"],
+    "features": []
+  }
+}

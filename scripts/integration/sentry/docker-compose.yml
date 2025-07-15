@@ -1,0 +1,17 @@
+services:
+  sentry-relay:
+    image: getsentry/relay:latest
+    container_name: sentry-relay-test
+    ports:
+      - "3001:3000" # Use 3001 to avoid conflicts with default port
+    volumes:
+      - ./relay-config:/work/.relay
+    environment:
+      - RELAY_LOG_LEVEL=debug
+    command: run
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/relay/healthcheck/live/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
