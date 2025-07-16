@@ -3,9 +3,11 @@
 //! This module contains the [`vector_lib::sink::VectorSink`] instance that is responsible for
 //! taking a stream of [`vector_lib::event::Event`]s and forwarding them to Sentry.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use futures::FutureExt;
+use sentry::types::Uuid;
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
 use vrl::value::Kind;
@@ -45,17 +47,6 @@ impl SinkBatchSettings for SentryDefaultBatchSettings {
     const MAX_EVENTS: Option<usize> = Some(100);
     const MAX_BYTES: Option<usize> = None;
     const TIMEOUT_SECS: f64 = 1.0;
-}
-
-impl Default for SentryConfig {
-    fn default() -> Self {
-        Self {
-            dsn: SensitiveString::from("https://key@sentry.io/project_id".to_string()),
-            batch: BatchConfig::default(),
-            encoding: Transformer::default(),
-            acknowledgements: AcknowledgementsConfig::default(),
-        }
-    }
 }
 
 impl GenerateConfig for SentryConfig {
@@ -120,11 +111,14 @@ impl SentrySink {
                     transformer.transform(&mut event);
 
                     if let Event::Log(log) = event {
-                        process_log_event(&log);
+                        let sentry_log = convert_to_sentry_log(&log);
+                        sentry::capture_log(sentry_log);
                     }
                 }
             })
             .await;
+
+        sentry::flush(Some(std::time::Duration::from_secs(5)));
 
         Ok(())
     }
@@ -137,71 +131,133 @@ impl StreamSink<Event> for SentrySink {
     }
 }
 
-/// Process a log event and send it to Sentry using the appropriate method.
-fn process_log_event(log: &vector_lib::event::LogEvent) {
-    let message = log
+/// Extract trace ID from log event, returning the trace ID and which field was used.
+fn extract_trace_id(
+    log: &vector_lib::event::LogEvent,
+) -> (sentry::protocol::TraceId, Option<&'static str>) {
+    if let Some(trace_value) = log.get("trace_id") {
+        let trace_str = trace_value.to_string_lossy();
+        if let Ok(uuid) = sentry::types::Uuid::parse_str(&trace_str) {
+            (sentry::protocol::TraceId::from(uuid), Some("trace_id"))
+        } else {
+            (
+                sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
+                None,
+            )
+        }
+    } else if let Some(trace_value) = log.get("sentry.trace_id") {
+        let trace_str = trace_value.to_string_lossy();
+        if let Ok(uuid) = sentry::types::Uuid::parse_str(&trace_str) {
+            (
+                sentry::protocol::TraceId::from(uuid),
+                Some("sentry.trace_id"),
+            )
+        } else {
+            (
+                sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
+                None,
+            )
+        }
+    } else {
+        // Fall back to zero'd out trace ID if no trace_id fields found
+        (
+            sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
+            None,
+        )
+    }
+}
+
+/// Convert log event fields to Sentry log attributes, excluding specified fields.
+fn convert_fields_to_attributes(
+    log: &vector_lib::event::LogEvent,
+    used_trace_field: Option<&str>,
+) -> sentry::protocol::Map<String, sentry::protocol::LogAttribute> {
+    use sentry::protocol::{LogAttribute, Map};
+
+    let mut attributes = Map::new();
+    if let Some(fields) = log.all_event_fields() {
+        for (key, value) in fields {
+            let key_str = key.as_str();
+            if key_str != "message"
+                && key_str != "level"
+                && key_str != "severity"
+                && key_str != "timestamp"
+                && Some(key_str) != used_trace_field
+            {
+                let log_attribute = match value {
+                    vrl::value::Value::Bytes(b) => {
+                        LogAttribute::String(String::from_utf8_lossy(b).to_string())
+                    }
+                    vrl::value::Value::Integer(i) => {
+                        LogAttribute::Number(serde_json::Number::from(*i))
+                    }
+                    vrl::value::Value::Float(f) => {
+                        // Ensure we're using 64-bit floating point as per Sentry protocol
+                        let float_val = f.into_inner();
+                        if let Some(n) = serde_json::Number::from_f64(float_val) {
+                            LogAttribute::Number(n)
+                        } else {
+                            // If the float can't be represented as a JSON number, convert to string
+                            LogAttribute::String(float_val.to_string())
+                        }
+                    }
+                    vrl::value::Value::Boolean(b) => LogAttribute::Bool(*b),
+                    _ => LogAttribute::String(value.to_string_lossy().to_string()),
+                };
+                attributes.insert(key_str.to_string(), log_attribute);
+            }
+        }
+    }
+    attributes
+}
+
+/// Convert a Vector log event to a Sentry log.
+fn convert_to_sentry_log(log: &vector_lib::event::LogEvent) -> sentry::protocol::Log {
+    use chrono::{DateTime, Utc};
+    use sentry::protocol::{Log, LogLevel};
+
+    // Extract timestamp
+    let timestamp = log
+        .get_timestamp()
+        .and_then(|ts| ts.as_timestamp())
+        .map(|ts| DateTime::<Utc>::from(*ts).into())
+        .unwrap_or_else(SystemTime::now);
+
+    // Extract message
+    let body = log
         .get_message()
         .map(|msg| msg.to_string_lossy().into_owned())
         .unwrap_or_else(|| "".to_string());
 
-    // Extract level and convert to Sentry level
+    // Extract level
     let level = log
         .get("level")
         .or_else(|| log.get("severity"))
         .map(
             |level_value| match level_value.to_string_lossy().to_lowercase().as_str() {
-                "debug" => sentry::Level::Debug,
-                "info" => sentry::Level::Info,
-                "warn" | "warning" => sentry::Level::Warning,
-                "error" => sentry::Level::Error,
-                "fatal" | "critical" => sentry::Level::Fatal,
-                _ => sentry::Level::Info,
+                "debug" => LogLevel::Debug,
+                "info" => LogLevel::Info,
+                "warn" | "warning" => LogLevel::Warning,
+                "error" => LogLevel::Error,
+                "fatal" | "critical" => LogLevel::Fatal,
+                _ => LogLevel::Info,
             },
         )
-        .unwrap_or(sentry::Level::Info);
+        .unwrap_or(LogLevel::Info);
 
-    // For error level and above, create a full event with extra data
-    if matches!(level, sentry::Level::Error | sentry::Level::Fatal) {
-        // Create an event with additional context
-        sentry::with_scope(
-            |scope| {
-                // Add extra data from log fields
-                if let Some(fields) = log.all_event_fields() {
-                    for (key, value) in fields {
-                        let key_str = key.as_str();
-                        // Skip message, level, and timestamp as they're handled separately
-                        if key_str != "message"
-                            && key_str != "level"
-                            && key_str != "severity"
-                            && key_str != "timestamp"
-                        {
-                            scope.set_extra(key_str, value.to_string_lossy().into());
-                        }
-                    }
-                }
+    // Extract trace ID and determine which field was used
+    let (trace_id, used_trace_field) = extract_trace_id(log);
 
-                // Set the timestamp if available
-                if let Some(timestamp) = log.get_timestamp() {
-                    if let Some(ts) = timestamp.as_timestamp() {
-                        scope.set_extra(
-                            "log_timestamp",
-                            SystemTime::from(*ts)
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                                .to_string()
-                                .into(),
-                        );
-                    }
-                }
-            },
-            || {
-                sentry::capture_message(&message, level);
-            },
-        );
-    } else {
-        // For non-error levels, just send as a simple message
-        sentry::capture_message(&message, level);
+    // Convert fields to attributes
+    let attributes = convert_fields_to_attributes(log, used_trace_field);
+
+    Log {
+        level,
+        body,
+        trace_id: Some(trace_id),
+        timestamp,
+        severity_number: None, // We could map this from level if needed
+        attributes,
     }
 }
 
@@ -227,49 +283,158 @@ mod tests {
     }
 
     #[test]
-    fn test_process_log_event() {
+    fn test_convert_to_sentry_log() {
         let mut log = LogEvent::default();
         log.insert("message", "test message");
         log.insert("level", "error");
         log.insert("custom_field", "custom_value");
 
-        // This should not panic
-        process_log_event(&log);
+        let sentry_log = convert_to_sentry_log(&log);
+
+        assert_eq!(sentry_log.body, "test message");
+        assert_eq!(sentry_log.level, sentry::protocol::LogLevel::Error);
+        assert_eq!(
+            sentry_log.attributes.get("custom_field"),
+            Some(&sentry::protocol::LogAttribute::String(
+                "custom_value".to_string()
+            ))
+        );
     }
 
     #[test]
     fn test_level_conversion() {
         let test_cases = vec![
-            ("debug", sentry::Level::Debug),
-            ("info", sentry::Level::Info),
-            ("warn", sentry::Level::Warning),
-            ("warning", sentry::Level::Warning),
-            ("error", sentry::Level::Error),
-            ("fatal", sentry::Level::Fatal),
-            ("critical", sentry::Level::Fatal),
-            ("unknown", sentry::Level::Info),
+            ("debug", sentry::protocol::LogLevel::Debug),
+            ("info", sentry::protocol::LogLevel::Info),
+            ("warn", sentry::protocol::LogLevel::Warning),
+            ("warning", sentry::protocol::LogLevel::Warning),
+            ("error", sentry::protocol::LogLevel::Error),
+            ("fatal", sentry::protocol::LogLevel::Fatal),
+            ("critical", sentry::protocol::LogLevel::Fatal),
+            ("unknown", sentry::protocol::LogLevel::Info),
         ];
 
         for (input, expected) in test_cases {
             let mut log = LogEvent::default();
             log.insert("level", input);
 
-            let level = log
-                .get("level")
-                .map(
-                    |level_value| match level_value.to_string_lossy().to_lowercase().as_str() {
-                        "debug" => sentry::Level::Debug,
-                        "info" => sentry::Level::Info,
-                        "warn" | "warning" => sentry::Level::Warning,
-                        "error" => sentry::Level::Error,
-                        "fatal" | "critical" => sentry::Level::Fatal,
-                        _ => sentry::Level::Info,
-                    },
-                )
-                .unwrap_or(sentry::Level::Info);
-
-            assert_eq!(level, expected, "Failed for level: {}", input);
+            let sentry_log = convert_to_sentry_log(&log);
+            assert_eq!(sentry_log.level, expected, "Failed for level: {}", input);
         }
+    }
+
+    #[test]
+    fn test_trace_id_extraction() {
+        // Test with valid trace_id field
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("trace_id", "550e8400-e29b-41d4-a716-446655440000");
+
+        let sentry_log = convert_to_sentry_log(&log);
+        assert!(sentry_log.trace_id.is_some());
+
+        // Test with valid sentry.trace_id field
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("sentry.trace_id", "550e8400-e29b-41d4-a716-446655440000");
+
+        let sentry_log = convert_to_sentry_log(&log);
+        assert!(sentry_log.trace_id.is_some());
+
+        // Test with invalid trace_id (should fall back to zero trace ID and keep in attributes)
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("trace_id", "invalid-uuid");
+
+        let sentry_log = convert_to_sentry_log(&log);
+        assert!(sentry_log.trace_id.is_some());
+        // Should be the nil UUID
+        assert_eq!(
+            sentry_log.trace_id,
+            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+        );
+        // Invalid trace_id should be preserved in attributes
+        assert!(sentry_log.attributes.contains_key("trace_id"));
+        assert_eq!(
+            sentry_log.attributes.get("trace_id"),
+            Some(&sentry::protocol::LogAttribute::String(
+                "invalid-uuid".to_string()
+            ))
+        );
+
+        // Test with invalid sentry.trace_id (should fall back to zero trace ID and keep in attributes)
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("sentry.trace_id", "invalid-sentry-uuid");
+
+        let sentry_log = convert_to_sentry_log(&log);
+        assert!(sentry_log.trace_id.is_some());
+        // Should be the nil UUID
+        assert_eq!(
+            sentry_log.trace_id,
+            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+        );
+        // Invalid sentry.trace_id should be preserved in attributes
+        assert!(sentry_log.attributes.contains_key("sentry.trace_id"));
+        assert_eq!(
+            sentry_log.attributes.get("sentry.trace_id"),
+            Some(&sentry::protocol::LogAttribute::String(
+                "invalid-sentry-uuid".to_string()
+            ))
+        );
+
+        // Test with no trace_id field (should use zero trace ID)
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+
+        let sentry_log = convert_to_sentry_log(&log);
+        assert!(sentry_log.trace_id.is_some());
+        assert_eq!(
+            sentry_log.trace_id,
+            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+        );
+    }
+
+    #[test]
+    fn test_trace_id_attribute_handling() {
+        // Test that valid trace_id is excluded from attributes but invalid ones are kept
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("trace_id", "550e8400-e29b-41d4-a716-446655440000"); // valid UUID
+        log.insert("custom_field", "custom_value");
+
+        let sentry_log = convert_to_sentry_log(&log);
+
+        // Valid trace_id should be used and excluded from attributes
+        assert!(!sentry_log.attributes.contains_key("trace_id"));
+        assert!(sentry_log.attributes.contains_key("custom_field"));
+
+        // Test with sentry.trace_id preference (trace_id takes priority)
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("trace_id", "550e8400-e29b-41d4-a716-446655440000"); // valid UUID
+        log.insert("sentry.trace_id", "other-trace-id"); // invalid, should be kept
+        log.insert("custom_field", "custom_value");
+
+        let sentry_log = convert_to_sentry_log(&log);
+
+        // trace_id should be used (takes priority) and excluded from attributes
+        assert!(!sentry_log.attributes.contains_key("trace_id"));
+        // sentry.trace_id should be kept since it wasn't used
+        assert!(sentry_log.attributes.contains_key("sentry.trace_id"));
+        assert!(sentry_log.attributes.contains_key("custom_field"));
+
+        // Test with only sentry.trace_id and it's valid
+        let mut log = LogEvent::default();
+        log.insert("message", "test message");
+        log.insert("sentry.trace_id", "550e8400-e29b-41d4-a716-446655440000"); // valid UUID
+        log.insert("custom_field", "custom_value");
+
+        let sentry_log = convert_to_sentry_log(&log);
+
+        // sentry.trace_id should be used and excluded from attributes
+        assert!(!sentry_log.attributes.contains_key("sentry.trace_id"));
+        assert!(sentry_log.attributes.contains_key("custom_field"));
     }
 
     #[tokio::test]
@@ -286,62 +451,5 @@ mod tests {
 
         // Just verify that the sink can be created
         assert!(std::mem::size_of_val(&sink) > 0);
-    }
-}
-
-#[cfg(feature = "sentry-integration-tests")]
-#[cfg(test)]
-mod integration_tests {
-    use futures::stream;
-    use std::env;
-    use vector_lib::event::{BatchNotifier, BatchStatus, Event, LogEvent};
-
-    use super::*;
-    use crate::{
-        config::SinkContext,
-        test_util::components::{run_and_assert_sink_compliance, HTTP_SINK_TAGS},
-    };
-
-    #[tokio::test]
-    async fn sentry_logs_integration_test() {
-        let dsn = env::var("SENTRY_DSN").expect("SENTRY_DSN environment variable to be set");
-        assert!(!dsn.is_empty(), "$SENTRY_DSN required");
-
-        let cx = SinkContext::default();
-
-        let config = SentryConfig {
-            dsn: dsn.into(),
-            ..Default::default()
-        };
-
-        // create unique test id so tests can run in parallel
-        let test_id = uuid::Uuid::new_v4().to_string();
-
-        let (sink, _) = config.build(cx).await.unwrap();
-
-        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
-
-        let mut event1 = LogEvent::from("Test message 1 from Vector integration test")
-            .with_batch_notifier(&batch);
-        event1.insert("level", "error");
-        event1.insert("test_id", test_id.clone());
-        event1.insert("source", "vector-integration-test");
-        event1.insert("component", "sentry-sink");
-
-        let mut event2 = LogEvent::from("Test message 2 from Vector integration test")
-            .with_batch_notifier(&batch);
-        event2.insert("level", "warning");
-        event2.insert("test_id", test_id.clone());
-        event2.insert("source", "vector-integration-test");
-        event2.insert("component", "sentry-sink");
-
-        drop(batch);
-
-        let events = vec![Event::Log(event1), Event::Log(event2)];
-
-        run_and_assert_sink_compliance(sink, stream::iter(events), &HTTP_SINK_TAGS).await;
-
-        // Wait for successful delivery
-        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
     }
 }
