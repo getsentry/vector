@@ -11,7 +11,10 @@ use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
 use vrl::value::Kind;
 
-use crate::sinks::prelude::*;
+use crate::{
+    codecs::{EncodingConfigWithFraming, Transformer},
+    sinks::prelude::*,
+};
 
 /// Configuration for the `sentry` sink.
 #[configurable_component(sink("sentry", "Deliver log events to Sentry."))]
@@ -28,7 +31,7 @@ pub struct SentryConfig {
 
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
-    encoding: Transformer,
+    encoding: EncodingConfigWithFraming,
 
     #[configurable(derived)]
     #[serde(
@@ -60,7 +63,9 @@ impl SinkConfig for SentryConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let batch_settings = self.batch.validate()?.into_batcher_settings()?;
 
-        let sink = SentrySink::new(self.dsn.clone(), self.encoding.clone(), batch_settings);
+        let transformer = self.encoding.transformer();
+
+        let sink = SentrySink::new(self.dsn.clone(), transformer, batch_settings);
 
         let healthcheck = healthcheck(self.dsn.clone()).boxed();
 
@@ -182,25 +187,23 @@ fn convert_fields_to_attributes(
             {
                 let sentry_value = match value {
                     vrl::value::Value::Bytes(b) => {
-                        LogAttribute::String(String::from_utf8_lossy(b).to_string())
+                        Value::String(String::from_utf8_lossy(b).to_string())
                     }
-                    vrl::value::Value::Integer(i) => {
-                        LogAttribute::Number(serde_json::Number::from(*i))
-                    }
+                    vrl::value::Value::Integer(i) => Value::Number(serde_json::Number::from(*i)),
                     vrl::value::Value::Float(f) => {
                         // Ensure we're using 64-bit floating point as per Sentry protocol
                         let float_val = f.into_inner();
                         if let Some(n) = serde_json::Number::from_f64(float_val) {
-                            LogAttribute::Number(n)
+                            Value::Number(n)
                         } else {
                             // If the float can't be represented as a JSON number, convert to string
-                            LogAttribute::String(float_val.to_string())
+                            Value::String(float_val.to_string())
                         }
                     }
-                    vrl::value::Value::Boolean(b) => LogAttribute::Bool(*b),
-                    _ => LogAttribute::String(value.to_string_lossy().to_string()),
+                    vrl::value::Value::Boolean(b) => Value::Bool(*b),
+                    _ => Value::String(value.to_string_lossy().to_string()),
                 };
-                attributes.insert(key_str.to_string(), sentry_value);
+                attributes.insert(key_str.to_string(), LogAttribute(sentry_value));
             }
         }
     }
@@ -420,7 +423,8 @@ mod tests {
     #[tokio::test]
     async fn test_sentry_sink_creation() {
         let dsn = SensitiveString::from("https://key@sentry.io/project_id".to_string());
-        let transformer = Transformer::default();
+        let encoding = EncodingConfigWithFraming::default();
+        let transformer = encoding.transformer();
         let batch_settings = BatcherSettings::new(
             Duration::from_secs(1),
             NonZeroUsize::new(1024).unwrap(),
