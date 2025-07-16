@@ -9408,6 +9408,8 @@ dependencies = [
  "native-tls",
  "reqwest 0.12.9",
  "sentry-core",
+ "sentry-log",
+ "sentry-tracing",
  "tokio",
  "ureq",
 ]
@@ -9422,6 +9424,28 @@ dependencies = [
  "sentry-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "sentry-log"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a693f27e3f63ae085cf7c176b5c44038af27c8a0170d01db30ccf776c2d40ce3"
+dependencies = [
+ "log",
+ "sentry-core",
+]
+
+[[package]]
+name = "sentry-tracing"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25c47d36bc80c74d26d568ffe970c37b337c061b7234ad6f2d159439c16f000"
+dependencies = [
+ "bitflags 2.9.0",
+ "sentry-core",
+ "tracing-core 0.1.33",
+ "tracing-subscriber",
 ]
 
 [[package]]

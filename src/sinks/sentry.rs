@@ -3,11 +3,9 @@
 //! This module contains the [`vector_lib::sink::VectorSink`] instance that is responsible for
 //! taking a stream of [`vector_lib::event::Event`]s and forwarding them to Sentry.
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use futures::FutureExt;
-use sentry::types::Uuid;
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
 use vrl::value::Kind;
@@ -100,7 +98,13 @@ impl SentrySink {
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         // Initialize Sentry client
-        let _guard = sentry::init(self.dsn.inner());
+        let _guard = sentry::init(
+            self.dsn.inner(),
+            sentry::ClientOptions {
+                enable_logs: true,
+                ..Default::default()
+            },
+        );
 
         input
             .batched(self.batch_settings.as_byte_size_config())
@@ -112,13 +116,19 @@ impl SentrySink {
 
                     if let Event::Log(log) = event {
                         let sentry_log = convert_to_sentry_log(&log);
-                        sentry::capture_log(sentry_log);
+                        // Use the current hub to capture the log
+                        let hub = sentry::Hub::current();
+                        hub.capture_log(sentry_log);
                     }
                 }
             })
             .await;
 
-        sentry::flush(Some(std::time::Duration::from_secs(5)));
+        // Use the current hub to flush
+        let hub = sentry::Hub::current();
+        hub.client().map(|client| {
+            client.close(Some(std::time::Duration::from_secs(5)));
+        });
 
         Ok(())
     }
@@ -137,33 +147,28 @@ fn extract_trace_id(
 ) -> (sentry::protocol::TraceId, Option<&'static str>) {
     if let Some(trace_value) = log.get("trace_id") {
         let trace_str = trace_value.to_string_lossy();
-        if let Ok(uuid) = sentry::types::Uuid::parse_str(&trace_str) {
-            (sentry::protocol::TraceId::from(uuid), Some("trace_id"))
-        } else {
+        if let Ok(uuid) = uuid::Uuid::parse_str(&trace_str) {
+            // Convert UUID to bytes and then to TraceId
             (
-                sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
-                None,
+                sentry::protocol::TraceId::from(uuid.into_bytes()),
+                Some("trace_id"),
             )
+        } else {
+            (sentry::protocol::TraceId::default(), None)
         }
     } else if let Some(trace_value) = log.get("sentry.trace_id") {
         let trace_str = trace_value.to_string_lossy();
-        if let Ok(uuid) = sentry::types::Uuid::parse_str(&trace_str) {
+        if let Ok(uuid) = uuid::Uuid::parse_str(&trace_str) {
             (
-                sentry::protocol::TraceId::from(uuid),
+                sentry::protocol::TraceId::from(uuid.into_bytes()),
                 Some("sentry.trace_id"),
             )
         } else {
-            (
-                sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
-                None,
-            )
+            (sentry::protocol::TraceId::default(), None)
         }
     } else {
-        // Fall back to zero'd out trace ID if no trace_id fields found
-        (
-            sentry::protocol::TraceId::from(sentry::types::Uuid::nil()),
-            None,
-        )
+        // Fall back to default trace ID if no trace_id fields found
+        (sentry::protocol::TraceId::default(), None)
     }
 }
 
@@ -184,7 +189,7 @@ fn convert_fields_to_attributes(
                 && key_str != "timestamp"
                 && Some(key_str) != used_trace_field
             {
-                let log_attribute = match value {
+                let sentry_value = match value {
                     vrl::value::Value::Bytes(b) => {
                         LogAttribute::String(String::from_utf8_lossy(b).to_string())
                     }
@@ -204,7 +209,7 @@ fn convert_fields_to_attributes(
                     vrl::value::Value::Boolean(b) => LogAttribute::Bool(*b),
                     _ => LogAttribute::String(value.to_string_lossy().to_string()),
                 };
-                attributes.insert(key_str.to_string(), log_attribute);
+                attributes.insert(key_str.to_string(), sentry_value);
             }
         }
     }
@@ -237,7 +242,7 @@ fn convert_to_sentry_log(log: &vector_lib::event::LogEvent) -> sentry::protocol:
             |level_value| match level_value.to_string_lossy().to_lowercase().as_str() {
                 "debug" => LogLevel::Debug,
                 "info" => LogLevel::Info,
-                "warn" | "warning" => LogLevel::Warning,
+                "warn" | "warning" => LogLevel::Warn,
                 "error" => LogLevel::Error,
                 "fatal" | "critical" => LogLevel::Fatal,
                 _ => LogLevel::Info,
@@ -292,12 +297,10 @@ mod tests {
         let sentry_log = convert_to_sentry_log(&log);
 
         assert_eq!(sentry_log.body, "test message");
-        assert_eq!(sentry_log.level, sentry::protocol::LogLevel::Error);
+        assert_eq!(sentry_log.level, sentry::protocol::Level::Error);
         assert_eq!(
             sentry_log.attributes.get("custom_field"),
-            Some(&sentry::protocol::LogAttribute::String(
-                "custom_value".to_string()
-            ))
+            Some(&sentry::protocol::Value::String("custom_value".to_string()))
         );
     }
 
@@ -341,49 +344,47 @@ mod tests {
         let sentry_log = convert_to_sentry_log(&log);
         assert!(sentry_log.trace_id.is_some());
 
-        // Test with invalid trace_id (should fall back to zero trace ID and keep in attributes)
+        // Test with invalid trace_id (should fall back to default trace ID and keep in attributes)
         let mut log = LogEvent::default();
         log.insert("message", "test message");
         log.insert("trace_id", "invalid-uuid");
 
         let sentry_log = convert_to_sentry_log(&log);
         assert!(sentry_log.trace_id.is_some());
-        // Should be the nil UUID
+        // Should be the default UUID
         assert_eq!(
             sentry_log.trace_id,
-            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+            Some(sentry::protocol::TraceId::default())
         );
         // Invalid trace_id should be preserved in attributes
         assert!(sentry_log.attributes.contains_key("trace_id"));
         assert_eq!(
             sentry_log.attributes.get("trace_id"),
-            Some(&sentry::protocol::LogAttribute::String(
-                "invalid-uuid".to_string()
-            ))
+            Some(&sentry::protocol::Value::String("invalid-uuid".to_string()))
         );
 
-        // Test with invalid sentry.trace_id (should fall back to zero trace ID and keep in attributes)
+        // Test with invalid sentry.trace_id (should fall back to default trace ID and keep in attributes)
         let mut log = LogEvent::default();
         log.insert("message", "test message");
         log.insert("sentry.trace_id", "invalid-sentry-uuid");
 
         let sentry_log = convert_to_sentry_log(&log);
         assert!(sentry_log.trace_id.is_some());
-        // Should be the nil UUID
+        // Should be the default UUID
         assert_eq!(
             sentry_log.trace_id,
-            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+            Some(sentry::protocol::TraceId::default())
         );
         // Invalid sentry.trace_id should be preserved in attributes
         assert!(sentry_log.attributes.contains_key("sentry.trace_id"));
         assert_eq!(
             sentry_log.attributes.get("sentry.trace_id"),
-            Some(&sentry::protocol::LogAttribute::String(
+            Some(&sentry::protocol::Value::String(
                 "invalid-sentry-uuid".to_string()
             ))
         );
 
-        // Test with no trace_id field (should use zero trace ID)
+        // Test with no trace_id field (should use default trace ID)
         let mut log = LogEvent::default();
         log.insert("message", "test message");
 
@@ -391,7 +392,7 @@ mod tests {
         assert!(sentry_log.trace_id.is_some());
         assert_eq!(
             sentry_log.trace_id,
-            Some(sentry::protocol::TraceId::from(sentry::types::Uuid::nil()))
+            Some(sentry::protocol::TraceId::default())
         );
     }
 
