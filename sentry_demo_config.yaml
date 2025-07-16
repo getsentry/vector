@@ -3,7 +3,8 @@
 
 sources:
   demo_logs:
-    type: "stdin"
+    type: "demo_logs"
+    format: "syslog"
 
 sinks:
   sentry_sink:
@@ -11,4 +12,4 @@ sinks:
     type: "sentry"
     dsn: "https://4865bee93ec668370e59ed2862ed05a0@o447951.ingest.us.sentry.io/4509675223187456"
     encoding:
-      codec: "json"
+      codec: "text"

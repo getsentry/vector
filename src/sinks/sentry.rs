@@ -29,9 +29,8 @@ pub struct SentryConfig {
     #[serde(default)]
     batch: BatchConfig<SentryDefaultBatchSettings>,
 
-    #[configurable(derived)]
-    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
-    encoding: EncodingConfigWithFraming,
+    #[serde(flatten)]
+    pub encoding: EncodingConfigWithFraming,
 
     #[configurable(derived)]
     #[serde(
