@@ -1,15 +1,23 @@
 # Vector configuration for Sentry sink demo
-# Send logs from stdin to Sentry
+# Send logs from de to Sentry
 
 sources:
   demo_logs:
-    type: "demo_logs"
-    format: "syslog"
+    type: demo_logs
+    interval: 1
+    format: json
 
 sinks:
+  console:
+    inputs:
+      - demo_logs
+    target: stdout
+    type: console
+    encoding:
+      codec: json
   sentry_sink:
     inputs: ["demo_logs"]
-    type: "sentry"
+    type: sentry
     dsn: "https://4865bee93ec668370e59ed2862ed05a0@o447951.ingest.us.sentry.io/4509675223187456"
     encoding:
-      codec: "text"
+      codec: json
