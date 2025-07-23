@@ -211,14 +211,14 @@ fn convert_to_sentry_log(log: &vector_lib::event::LogEvent) -> Log {
     let timestamp = log
         .get_timestamp()
         .and_then(|ts| ts.as_timestamp())
-        .map(|ts| DateTime::<Utc>::from(*ts).into())
+        .map(|ts| (*ts).into())
         .unwrap_or_else(SystemTime::now);
 
     // Extract message
     let body = log
         .get_message()
         .map(|msg| msg.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
     // Extract level
     let level = log
