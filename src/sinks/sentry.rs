@@ -86,6 +86,7 @@ pub(super) struct SentrySink {
     dsn: SensitiveString,
     transformer: Transformer,
     batch_settings: BatcherSettings,
+    // guard
 }
 
 impl SentrySink {
@@ -107,6 +108,7 @@ impl SentrySink {
             self.dsn.inner(),
             sentry::ClientOptions {
                 enable_logs: true,
+                // before_send_log -> in the future client sdk override
                 ..Default::default()
             },
         ));
@@ -122,6 +124,7 @@ impl SentrySink {
                     if let Event::Log(log) = event {
                         let sentry_log = convert_to_sentry_log(&log);
                         // Use the current hub to capture the log
+                        // TODO: figure out threading / use sentry::Hub::main
                         let hub = sentry::Hub::current();
                         hub.capture_log(sentry_log);
                     }
@@ -205,8 +208,6 @@ fn convert_fields_to_attributes(
 
 /// Convert a Vector log event to a Sentry log.
 fn convert_to_sentry_log(log: &vector_lib::event::LogEvent) -> Log {
-    use chrono::{DateTime, Utc};
-
     // Extract timestamp
     let timestamp = log
         .get_timestamp()
